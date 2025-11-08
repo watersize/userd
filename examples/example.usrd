@@ -1,0 +1,20 @@
+# Простые примеры для .usrd
+
+# Интерактивный калькулятор на .usrd
+# Использует встроенные функции: get(prompt), to_int(x), apply_op(a,b,op)
+
+int-a = to_int(get("Enter first integer: "));
+int-b = to_int(get("Enter second integer: "));
+int-op = to_int(get("Choose operator (1:+,2:-,3:*,4:/): "));
+int-res = apply_op(a, b, op);
+res;
+
+# Пример класса и методов (неинтерактивный)
+class Point {
+  rtd __init__(self,x,y) { self.x = x; self.y = y; }
+  rtd move(self,dx,dy) { self.x = self.x + dx; self.y = self.y + dy; }
+}
+Point-p = Point(1,2);
+p.move(3,4);
+# Посмотреть поля
+p.x; p.y;

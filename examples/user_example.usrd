@@ -1,0 +1,17 @@
+// Пример: окно и случайный цвет
+str-title = "Demo Random Rect";
+int-id = gui_window(title, 320, 200);
+
+// получить случайный цвет канал 0..255
+int-r = secure_random(256);
+int-g = secure_random(256);
+int-b = secure_random(256);
+
+// Нарисовать прямоугольник в центре: draw_rect(id, canvas_w, canvas_h, x,y,w,h, r,g,b)
+draw_rect(id, 320, 200, 60, 40, 200, 140, r, g, b);
+
+// Показать сообщение и ждать закрытия окна
+gui_message("Info", "Random rect drawn. Close the window to exit.");
+
+// Запустить цикл GUI
+gui_run();

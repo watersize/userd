@@ -1,0 +1,43 @@
+// Простая TODO-list демонстрация
+// Использует canvas и ручную регистрацию виджетов (кнопки) + обработчики
+
+str-title = "userd TODO";
+int-win = gui_window(title, 360, 240);
+
+// состояния задач
+int-t0 = 0; // 0 = not done, 1 = done
+int-t1 = 0;
+int-t2 = 0;
+
+rtd render() {
+    // очистить фон
+    canvas_clear(win, 240, 240, 240, 255);
+    // заголовок
+    canvas_draw_text(win, 12, 8, "TODO List (click checkbox)");
+    // item 0
+    if (t0 == 1) { canvas_draw_text(win, 44, 40, "[x] Buy milk"); } else { canvas_draw_text(win, 44, 40, "[ ] Buy milk"); }
+    // draw checkbox rect
+    draw_rect(win, 360, 240, 12, 36, 24, 24, 24, 255);
+    // item 1
+    if (t1 == 1) { canvas_draw_text(win, 44, 80, "[x] Write code"); } else { canvas_draw_text(win, 44, 80, "[ ] Write code"); }
+    draw_rect(win, 360, 240, 12, 76, 24, 24, 24, 255);
+    // item 2
+    if (t2 == 1) { canvas_draw_text(win, 44, 120, "[x] Read book"); } else { canvas_draw_text(win, 44, 120, "[ ] Read book"); }
+    draw_rect(win, 360, 240, 12, 116, 24, 24, 24, 255);
+    // present
+    canvas_present(win);
+}
+
+// обработчики — каждый обрабатывает свой виджет
+rtd toggle0(x,y) { if (t0 == 0) { t0 = 1; } else { t0 = 0; } render(); }
+rtd toggle1(x,y) { if (t1 == 0) { t1 = 1; } else { t1 = 0; } render(); }
+rtd toggle2(x,y) { if (t2 == 0) { t2 = 1; } else { t2 = 0; } render(); }
+
+// зарегать виджеты (checkbox areas) с координатами
+register_widget(win, 12, 36, 24, 24, "toggle0");
+register_widget(win, 12, 76, 24, 24, "toggle1");
+register_widget(win, 12, 116, 24, 24, "toggle2");
+
+// начальная отрисовка и запуск GUI
+render();
+gui_run();

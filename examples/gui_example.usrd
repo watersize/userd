@@ -1,0 +1,13 @@
+// GUI example (minimal)
+// Создаёт окно, регистрирует обработчик клика и запускает GUI-цикл.
+
+str-title = "My Window";
+int-id = gui_window(title, 300, 200);
+
+rtd on_click(x,y) {
+	gui_message("Clicked", "You clicked!");
+}
+
+gui_button(id, "Click me", "on_click");
+// запустить цикл обработки событий (блокирует до закрытия всех окон)
+gui_run();
