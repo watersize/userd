@@ -13,7 +13,7 @@
 Сборка и тесты (Windows PowerShell):
 
 ```powershell
-cd C:\Users\1thproj\Documents\rustprojects\userd
+cd example\userd
 cargo test
 ```
 
