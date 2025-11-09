@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::io::{self, Write};
+use std::thread;
+use std::time::Duration;
+use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::atomic::AtomicU64;
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -36,6 +40,28 @@ pub struct Object {
 pub struct VM {
     globals: HashMap<String, Value>,
     frames: Vec<HashMap<String, Value>>, // call stack locals
+}
+
+static CH_SENDERS: OnceLock<Mutex<HashMap<u64, mpsc::Sender<String>>>> = OnceLock::new();
+static CH_RECEIVERS: OnceLock<Mutex<HashMap<u64, mpsc::Receiver<String>>>> = OnceLock::new();
+static CH_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static CH_BCAST: OnceLock<Mutex<HashMap<u64, Vec<(u64, mpsc::Sender<String>)>>>> = OnceLock::new();
+static SUB_TO_CHANNEL: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
+
+fn ch_senders() -> &'static Mutex<HashMap<u64, mpsc::Sender<String>>> {
+    CH_SENDERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ch_receivers() -> &'static Mutex<HashMap<u64, mpsc::Receiver<String>>> {
+    CH_RECEIVERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ch_bcast() -> &'static Mutex<HashMap<u64, Vec<(u64, mpsc::Sender<String>)>>> {
+    CH_BCAST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn sub_to_channel() -> &'static Mutex<HashMap<u64, u64>> {
+    SUB_TO_CHANNEL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 impl VM {
@@ -124,7 +150,14 @@ impl VM {
             Expr::Int(n) => Ok(Value::Int(n)),
             Expr::Float(f) => Ok(Value::Float(f)),
             Expr::Str(s) => Ok(Value::Str(s)),
-            Expr::Ident(name) => self.get_var(&name).ok_or_else(|| format!("undefined: {}", name)),
+            Expr::Ident(name) => {
+                if let Some(v) = self.get_var(&name) { Ok(v) }
+                else {
+                    // debug assistance: print available globals and frames to stderr
+                    eprintln!("VM: undefined identifier '{}' — globals: {:?} — frames count: {}", name, self.globals.keys().collect::<Vec<_>>(), self.frames.len());
+                    return Err(format!("undefined: {}", name));
+                }
+            }
             Expr::MemberAccess { receiver, field } => {
                 let r = self.eval_expr(*receiver)?;
                 if let Value::Object(o) = r {
@@ -487,6 +520,176 @@ impl VM {
                                 println!("{}: {}", title, text);
                                 return Ok(Value::Int(1));
                             }
+                        }
+                        if fname == "sleep_ms" {
+                            // sleep_ms(ms)
+                            if args.len() != 1 { return Err("sleep_ms requires 1 argument".to_string()); }
+                            let v = self.eval_expr(args[0].clone())?;
+                            let ms = if let Value::Int(n) = v { n } else { return Err("sleep_ms: arg must be int".to_string()) };
+                            thread::sleep(Duration::from_millis(ms as u64));
+                            return Ok(Value::Int(1));
+                        }
+                        if fname == "spawn" {
+                            // spawn(function_name)
+                            if args.len() != 1 { return Err("spawn requires 1 argument".to_string()); }
+                            let nv = self.eval_expr(args[0].clone())?;
+                            let fname = if let Value::Str(s) = nv { s } else { return Err("spawn: arg must be string".to_string()) };
+                            // find function in current globals
+                            if let Some(Value::Function(fobj)) = self.get_var(&fname) {
+                                let fclone = fobj.clone();
+                                // spawn thread and execute function body in fresh VM instance
+                                thread::spawn(move || {
+                                    let mut vm2 = VM::new();
+                                    // run function body (no args / minimal environment)
+                                    let _ = vm2.execute_program(fclone.body.clone());
+                                });
+                                return Ok(Value::Int(1));
+                            } else {
+                                return Err("spawn: function not found".to_string());
+                            }
+                        }
+                        if fname == "channel_create" {
+                            // channel_create() -> id (creates primary channel with one receiver)
+                            let id = CH_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let (tx, rx) = mpsc::channel::<String>();
+                            if let Ok(mut s) = ch_senders().lock() { s.insert(id, tx); }
+                            if let Ok(mut r) = ch_receivers().lock() { r.insert(id, rx); }
+                            return Ok(Value::Int(id as i64));
+                        }
+                        if fname == "channel_send" {
+                            // channel_send(id, text) -> 1 on success
+                            if args.len() != 2 { return Err("channel_send requires 2 arguments".to_string()); }
+                            let idv = self.eval_expr(args[0].clone())?;
+                            let tv = self.eval_expr(args[1].clone())?;
+                            let id = if let Value::Int(n) = idv { n as u64 } else { return Err("channel_send: id must be int".to_string()) };
+                            let s = if let Value::Str(st) = tv { st } else { return Err("channel_send: text must be string".to_string()) };
+                            let mut sent = false;
+                            if let Ok(map) = ch_senders().lock() {
+                                if let Some(tx) = map.get(&id) {
+                                    let _ = tx.send(s.clone());
+                                    sent = true;
+                                }
+                            }
+                            // send to broadcast subscribers if any
+                            if let Ok(bmap) = ch_bcast().lock() {
+                                if let Some(list) = bmap.get(&id) {
+                                    for (_subid, tx) in list.iter() {
+                                        let _ = tx.send(s.clone());
+                                        sent = true;
+                                    }
+                                }
+                            }
+                            if sent { return Ok(Value::Int(1)); }
+                            return Err("channel_send: channel not found".to_string());
+                        }
+                        if fname == "channel_try_recv" {
+                            // channel_try_recv(id) -> object { ok:1, msg: "..." } or { ok:0 }
+                            if args.len() != 1 { return Err("channel_try_recv requires 1 argument".to_string()); }
+                            let idv = self.eval_expr(args[0].clone())?;
+                            let id = if let Value::Int(n) = idv { n as u64 } else { return Err("channel_try_recv: id must be int".to_string()) };
+                            if let Ok(mut map) = ch_receivers().lock() {
+                                if let Some(rx) = map.get_mut(&id) {
+                                    match rx.try_recv() {
+                                        Ok(s) => {
+                                            // build Result object { ok:1, msg: s }
+                                            let mut fields = HashMap::new();
+                                            fields.insert("ok".to_string(), Value::Int(1));
+                                            fields.insert("msg".to_string(), Value::Str(s));
+                                            let obj = Rc::new(RefCell::new(Object { class_name: "Result".to_string(), fields, methods: HashMap::new() }));
+                                            return Ok(Value::Object(obj));
+                                        }
+                                        Err(mpsc::TryRecvError::Empty) => {
+                                            let mut fields = HashMap::new();
+                                            fields.insert("ok".to_string(), Value::Int(0));
+                                            let obj = Rc::new(RefCell::new(Object { class_name: "Result".to_string(), fields, methods: HashMap::new() }));
+                                            return Ok(Value::Object(obj));
+                                        }
+                                        Err(_) => return Err("channel_try_recv: receive error".to_string()),
+                                    }
+                                }
+                            }
+                            return Err("channel_try_recv: channel not found".to_string());
+                        }
+                        if fname == "channel_recv" {
+                            // channel_recv(id) -> blocks until message (returns string)
+                            if args.len() != 1 { return Err("channel_recv requires 1 argument".to_string()); }
+                            let idv = self.eval_expr(args[0].clone())?;
+                            let id = if let Value::Int(n) = idv { n as u64 } else { return Err("channel_recv: id must be int".to_string()) };
+                            if let Ok(mut map) = ch_receivers().lock() {
+                                if let Some(rx) = map.get_mut(&id) {
+                                    match rx.recv() {
+                                        Ok(s) => return Ok(Value::Str(s)),
+                                        Err(_) => return Err("channel_recv: receive error".to_string()),
+                                    }
+                                }
+                            }
+                            return Err("channel_recv: channel not found".to_string());
+                        }
+                        if fname == "channel_subscribe" {
+                            // channel_subscribe(channel_id) -> subscriber_id
+                            if args.len() != 1 { return Err("channel_subscribe requires 1 argument".to_string()); }
+                            let idv = self.eval_expr(args[0].clone())?;
+                            let chid = if let Value::Int(n) = idv { n as u64 } else { return Err("channel_subscribe: id must be int".to_string()) };
+                            // create new tx/rx pair for subscriber
+                            let sub_id = CH_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let (tx, rx) = mpsc::channel::<String>();
+                            // register receiver under sub_id
+                            if let Ok(mut rmap) = ch_receivers().lock() { rmap.insert(sub_id, rx); }
+                            // register sender in bcast list
+                            if let Ok(mut bmap) = ch_bcast().lock() {
+                                bmap.entry(chid).or_insert_with(Vec::new).push((sub_id, tx));
+                            }
+                            // remember mapping
+                            if let Ok(mut m) = sub_to_channel().lock() { m.insert(sub_id, chid); }
+                            return Ok(Value::Int(sub_id as i64));
+                        }
+                        if fname == "channel_close" {
+                            // channel_close(id) - closes channel or subscriber and cleans resources
+                            if args.len() != 1 { return Err("channel_close requires 1 argument".to_string()); }
+                            let idv = self.eval_expr(args[0].clone())?;
+                            let id = if let Value::Int(n) = idv { n as u64 } else { return Err("channel_close: id must be int".to_string()) };
+                            // first, if it's a primary channel
+                            if let Ok(mut smap) = ch_senders().lock() {
+                                if smap.remove(&id).is_some() {
+                                    // remove primary receiver too
+                                    if let Ok(mut rmap) = ch_receivers().lock() { rmap.remove(&id); }
+                                    // remove and cleanup broadcast subscribers
+                                    if let Ok(mut bmap) = ch_bcast().lock() {
+                                        if let Some(list) = bmap.remove(&id) {
+                                            for (subid, _tx) in list {
+                                                if let Ok(mut rmap) = ch_receivers().lock() { rmap.remove(&subid); }
+                                                if let Ok(mut m) = sub_to_channel().lock() { m.remove(&subid); }
+                                            }
+                                        }
+                                    }
+                                    return Ok(Value::Int(1));
+                                }
+                            }
+                            // if it's a subscriber or receiver id
+                            if let Ok(mut rmap) = ch_receivers().lock() {
+                                if rmap.remove(&id).is_some() {
+                                    // if subscriber, remove its sender from bcast list
+                                    if let Ok(mut m) = sub_to_channel().lock() {
+                                        if let Some(chid) = m.remove(&id) {
+                                            if let Ok(mut bmap) = ch_bcast().lock() {
+                                                if let Some(list) = bmap.get_mut(&chid) {
+                                                    list.retain(|(sid, _)| *sid != id);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    return Ok(Value::Int(1));
+                                }
+                            }
+                            return Err("channel_close: id not found".to_string());
+                        }
+                        if fname == "set_theme" {
+                            // set_theme(name)
+                            if args.len() != 1 { return Err("set_theme requires 1 argument".to_string()); }
+                            let nv = self.eval_expr(args[0].clone())?;
+                            let name = if let Value::Str(s) = nv { s } else { return Err("set_theme: arg must be string".to_string()) };
+                            #[cfg(target_os = "windows")] { crate::platform::windows::set_theme(&name); }
+                            return Ok(Value::Int(1));
                         }
                         let val = self.get_var(&fname).ok_or_else(|| format!("undefined function/class {}", fname))?;
                         match val {

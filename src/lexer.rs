@@ -65,7 +65,23 @@ impl Lexer {
                 '+' => Token::Plus,
                 '-' => Token::Minus,
                 '*' => Token::Asterisk,
-                '/' => Token::Slash,
+                '/' => {
+                    // support single-line comments starting with '//'
+                    if let Some(next) = self.peek() {
+                        if next == '/' {
+                            // consume the second '/'
+                            self.pos += 1;
+                            // skip until end of line or EOF
+                            while let Some(c) = self.peek() {
+                                self.pos += 1;
+                                if c == '\n' { break; }
+                            }
+                            // after skipping comment, fetch next token
+                            return self.next_token();
+                        }
+                    }
+                    Token::Slash
+                }
                 '(' => Token::LParen,
                 ')' => Token::RParen,
                 '{' => Token::LBrace,

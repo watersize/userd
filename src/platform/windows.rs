@@ -20,6 +20,8 @@ type WPARAM = usize;
 type LRESULT = isize;
 type UINT = u32;
 
+const SRCCOPY: i32 = 0x00CC0020;
+
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF0000;
 const CW_USEDEFAULT: i32 = 0x80000000u32 as i32;
 const SW_SHOW: i32 = 5;
@@ -68,6 +70,9 @@ struct MSG {
 }
 
 #[repr(C)]
+struct RECT { left: i32, top: i32, right: i32, bottom: i32 }
+
+#[repr(C)]
 struct BITMAPINFOHEADER {
     biSize: u32,
     biWidth: i32,
@@ -104,6 +109,7 @@ unsafe extern "system" {
     fn InvalidateRect(hWnd: HWND, lpRect: *const c_void, bErase: i32) -> i32;
     fn BeginPaint(hWnd: HWND, lpPaint: *mut PAINTSTRUCT) -> HDC;
     fn EndPaint(hWnd: HWND, lpPaint: *mut PAINTSTRUCT) -> i32;
+    fn GetClientRect(hWnd: HWND, lpRect: *mut RECT) -> i32;
     fn SetWindowLongPtrW(hWnd: HWND, nIndex: i32, dwNewLong: isize) -> isize;
     fn GetWindowLongPtrW(hWnd: HWND, nIndex: i32) -> isize;
 }
@@ -113,6 +119,10 @@ unsafe extern "system" {
     fn SetDIBitsToDevice(hdc: HDC, xDest: c_int, yDest: c_int, w: u32, h: u32,
                          xSrc: c_int, ySrc: c_int, StartScan: u32, cLines: u32,
                          lpvBits: *const c_void, lpbmi: *const BITMAPINFO, ColorUse: u32) -> c_int;
+    fn TextOutW(hdc: HDC, nXStart: c_int, nYStart: c_int, lpString: *const u16, cchString: c_int) -> i32;
+    fn StretchDIBits(hdc: HDC, xDest: c_int, yDest: c_int, DestWidth: c_int, DestHeight: c_int,
+                     xSrc: c_int, ySrc: c_int, SrcWidth: c_int, SrcHeight: c_int,
+                     lpvBits: *const c_void, lpbmi: *const BITMAPINFO, iUsage: u32, rop: i32) -> c_int;
 }
 
 fn to_wide(s: &str) -> Vec<u16> {
@@ -141,6 +151,8 @@ static EVENTS: OnceLock<Mutex<Vec<(u64, (i32,i32))>>> = OnceLock::new();
 static HANDLERS: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
 static HWND_MAP: OnceLock<Mutex<HashMap<usize, u64>>> = OnceLock::new();
 static WIDGETS: OnceLock<Mutex<HashMap<u64, Vec<Widget>>>> = OnceLock::new();
+static TEXTS: OnceLock<Mutex<HashMap<u64, Vec<(i32,i32,String)>>>> = OnceLock::new();
+static THEME_BG: OnceLock<Mutex<[u8;4]>> = OnceLock::new();
 
 fn registry() -> &'static Mutex<HashMap<u64, Sender>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
@@ -194,6 +206,36 @@ pub struct Widget {
 
 fn widgets_registry() -> &'static Mutex<HashMap<u64, Vec<Widget>>> {
     WIDGETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn texts_registry() -> &'static Mutex<HashMap<u64, Vec<(i32,i32,String)>>> {
+    TEXTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn theme_bg() -> &'static Mutex<[u8;4]> {
+    THEME_BG.get_or_init(|| Mutex::new([240u8,240u8,240u8,255u8]))
+}
+
+#[derive(Debug)]
+struct CanvasState {
+    buf: Vec<u8>,
+    w: i32,
+    h: i32,
+    bg: [u8;4],
+}
+
+
+pub fn push_text(win_id: u64, x: i32, y: i32, text: &str) {
+    if let Ok(mut reg) = texts_registry().lock() {
+        reg.entry(win_id).or_insert_with(Vec::new).push((x,y,text.to_string()));
+    }
+}
+
+pub fn take_texts(win_id: u64) -> Vec<(i32,i32,String)> {
+    if let Ok(mut reg) = texts_registry().lock() {
+        if let Some(v) = reg.remove(&win_id) { return v; }
+    }
+    Vec::new()
 }
 
 /// Register a rectangular widget on a window. Returns widget id.
@@ -252,6 +294,26 @@ pub fn create_window(title: &str, w: i32, h: i32) -> u64 {
                     let _ = hdc;
                     EndPaint(hWnd, &mut ps as *mut _);
                 }
+                return 0;
+            }
+            // handle resize: WM_SIZE (0x0005)
+            else if msg == 0x0005 {
+                // l_param: low-order word new width, high-order word new height
+                let new_w = (l_param & 0xFFFF) as i16 as i32;
+                let new_h = ((l_param >> 16) & 0xFFFF) as i16 as i32;
+                unsafe {
+                    let bh_ptr = GetWindowLongPtrW(hWnd, GWLP_USERDATA) as *mut Mutex<CanvasState>;
+                    if !bh_ptr.is_null() {
+                        if let Ok(mut guard) = (*bh_ptr).lock() {
+                            let new_size = (new_w as usize).saturating_mul(new_h as usize).saturating_mul(4);
+                            guard.buf = vec![0u8; new_size];
+                            for i in (0..guard.buf.len()).step_by(4) { guard.buf[i+0]=guard.bg[0]; guard.buf[i+1]=guard.bg[1]; guard.buf[i+2]=guard.bg[2]; guard.buf[i+3]=guard.bg[3]; }
+                            guard.w = new_w;
+                            guard.h = new_h;
+                        }
+                    }
+                }
+                unsafe { InvalidateRect(hWnd, null(), 1); }
                 return 0;
             } else if msg == WM_DESTROY {
                 unsafe { PostQuitMessage(0); }
@@ -318,9 +380,13 @@ pub fn create_window(title: &str, w: i32, h: i32) -> u64 {
                 UpdateWindow(hwnd);
             }
 
-            // Shared persistent buffer: allocate full RGBA buffer for window size and store in GWLP_USERDATA
+            // Shared persistent canvas state: allocate buffer and store width/height/background in GWLP_USERDATA
+            let bg = *theme_bg().lock().unwrap();
             let bufsize = (w as usize).saturating_mul(h as usize).saturating_mul(4);
-            let buffer_holder: Box<Mutex<Vec<u8>>> = Box::new(Mutex::new(vec![0u8; bufsize]));
+            let mut buf = vec![0u8; bufsize];
+            for i in (0..buf.len()).step_by(4) { buf[i+0]=bg[0]; buf[i+1]=bg[1]; buf[i+2]=bg[2]; buf[i+3]=bg[3]; }
+            let canvas = CanvasState { buf, w, h, bg };
+            let buffer_holder: Box<Mutex<CanvasState>> = Box::new(Mutex::new(canvas));
             let bh_ptr = Box::into_raw(buffer_holder) as isize;
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, bh_ptr); }
             // store hwnd -> id mapping for event lookup
@@ -332,23 +398,26 @@ pub fn create_window(title: &str, w: i32, h: i32) -> u64 {
             let rx_local = rx;
             let hwnd_local = hwnd as usize;
             std::thread::spawn(move || {
-                let canvas_w = w as usize;
-                let canvas_h = h as usize;
+                // canvas size will be read from the CanvasState under lock when needed
                 for cmd in rx_local {
                     match cmd {
                         WindowCommand::Blit(buf, bw, bh) => {
                             // replace buffer contents (if sizes match) or resize
                             unsafe {
-                                let bh_ptr = GetWindowLongPtrW(hwnd_local as HWND, GWLP_USERDATA) as *mut Mutex<Vec<u8>>;
+                                let bh_ptr = GetWindowLongPtrW(hwnd_local as HWND, GWLP_USERDATA) as *mut Mutex<CanvasState>;
                                 if !bh_ptr.is_null() {
                                     if let Ok(mut guard) = (*bh_ptr).lock() {
                                         let expected = (bw as usize).saturating_mul(bh as usize).saturating_mul(4);
-                                        if guard.len() == expected {
-                                            guard.copy_from_slice(&buf[..expected.min(buf.len())]);
+                                        if guard.buf.len() == expected {
+                                            guard.buf.copy_from_slice(&buf[..expected.min(buf.len())]);
+                                            guard.w = bw;
+                                            guard.h = bh;
                                         } else {
-                                            *guard = vec![0u8; expected];
+                                            guard.buf = vec![0u8; expected];
                                             let copy_len = expected.min(buf.len());
-                                            guard[..copy_len].copy_from_slice(&buf[..copy_len]);
+                                            guard.buf[..copy_len].copy_from_slice(&buf[..copy_len]);
+                                            guard.w = bw;
+                                            guard.h = bh;
                                         }
                                     }
                                 }
@@ -358,15 +427,16 @@ pub fn create_window(title: &str, w: i32, h: i32) -> u64 {
                         }
                         WindowCommand::Clear(rr,gg,bb,aa) => {
                             unsafe {
-                                let bh_ptr = GetWindowLongPtrW(hwnd_local as HWND, GWLP_USERDATA) as *mut Mutex<Vec<u8>>;
+                                let bh_ptr = GetWindowLongPtrW(hwnd_local as HWND, GWLP_USERDATA) as *mut Mutex<CanvasState>;
                                 if !bh_ptr.is_null() {
                                     if let Ok(mut guard) = (*bh_ptr).lock() {
-                                        for i in (0..guard.len()).step_by(4) {
-                                            guard[i+0] = rr;
-                                            guard[i+1] = gg;
-                                            guard[i+2] = bb;
-                                            guard[i+3] = aa;
+                                        for i in (0..guard.buf.len()).step_by(4) {
+                                            guard.buf[i+0] = rr;
+                                            guard.buf[i+1] = gg;
+                                            guard.buf[i+2] = bb;
+                                            guard.buf[i+3] = aa;
                                         }
+                                        guard.bg = [rr,gg,bb,aa];
                                     }
                                 }
                                 InvalidateRect(hwnd_local as HWND, null(), 1);
@@ -379,9 +449,11 @@ pub fn create_window(title: &str, w: i32, h: i32) -> u64 {
                         WindowCommand::DrawText(x,y,txt) => {
                             // very small placeholder: draw a simple colored rectangle behind where text would be
                             unsafe {
-                                let bh_ptr = GetWindowLongPtrW(hwnd_local as HWND, GWLP_USERDATA) as *mut Mutex<Vec<u8>>;
+                                let bh_ptr = GetWindowLongPtrW(hwnd_local as HWND, GWLP_USERDATA) as *mut Mutex<CanvasState>;
                                 if !bh_ptr.is_null() {
                                     if let Ok(mut guard) = (*bh_ptr).lock() {
+                                        let canvas_w = guard.w.max(0) as usize;
+                                        let canvas_h = guard.h.max(0) as usize;
                                         let tw = 8usize * txt.len();
                                         let th = 12usize;
                                         let cx = x.max(0) as usize;
@@ -389,12 +461,12 @@ pub fn create_window(title: &str, w: i32, h: i32) -> u64 {
                                         for py in cy..(cy+th).min(canvas_h) {
                                             for px in cx..(cx+tw).min(canvas_w) {
                                                 let idx = (py * canvas_w + px) * 4;
-                                                if idx + 3 < guard.len() {
+                                                if idx + 3 < guard.buf.len() {
                                                     // background: dark gray
-                                                    guard[idx+0] = 60;
-                                                    guard[idx+1] = 60;
-                                                    guard[idx+2] = 60;
-                                                    guard[idx+3] = 255;
+                                                    guard.buf[idx+0] = 60;
+                                                    guard.buf[idx+1] = 60;
+                                                    guard.buf[idx+2] = 60;
+                                                    guard.buf[idx+3] = 255;
                                                 }
                                             }
                                         }
@@ -405,10 +477,12 @@ pub fn create_window(title: &str, w: i32, h: i32) -> u64 {
                         }
                         WindowCommand::DrawRect(x,y,ww,hh,rr,gg,bb,aa) => {
                             unsafe {
-                                let bh_ptr = GetWindowLongPtrW(hwnd_local as HWND, GWLP_USERDATA) as *mut Mutex<Vec<u8>>;
+                                let bh_ptr = GetWindowLongPtrW(hwnd_local as HWND, GWLP_USERDATA) as *mut Mutex<CanvasState>;
                                 if !bh_ptr.is_null() {
                                     if let Ok(mut guard) = (*bh_ptr).lock() {
-                                        if guard.len() < canvas_w.saturating_mul(canvas_h).saturating_mul(4) { /* skip if buffer unexpected */ }
+                                        let canvas_w = guard.w.max(0) as usize;
+                                        let canvas_h = guard.h.max(0) as usize;
+                                        if guard.buf.len() < canvas_w.saturating_mul(canvas_h).saturating_mul(4) { /* skip if buffer unexpected */ }
                                         // clamp coordinates
                                         let rx0 = x.max(0) as usize;
                                         let ry0 = y.max(0) as usize;
@@ -417,11 +491,11 @@ pub fn create_window(title: &str, w: i32, h: i32) -> u64 {
                                         for py in ry0..ry1 {
                                             for px in rx0..rx1 {
                                                 let idx = (py * canvas_w + px) * 4;
-                                                if idx + 3 < guard.len() {
-                                                    guard[idx + 0] = rr;
-                                                    guard[idx + 1] = gg;
-                                                    guard[idx + 2] = bb;
-                                                    guard[idx + 3] = aa;
+                                                if idx + 3 < guard.buf.len() {
+                                                    guard.buf[idx + 0] = rr;
+                                                    guard.buf[idx + 1] = gg;
+                                                    guard.buf[idx + 2] = bb;
+                                                    guard.buf[idx + 3] = aa;
                                                 }
                                             }
                                         }
@@ -438,7 +512,7 @@ pub fn create_window(title: &str, w: i32, h: i32) -> u64 {
                 }
                 // cleanup box
                 unsafe {
-                    let bh_ptr = GetWindowLongPtrW(hwnd_local as HWND, GWLP_USERDATA) as *mut Mutex<Vec<u8>>;
+                    let bh_ptr = GetWindowLongPtrW(hwnd_local as HWND, GWLP_USERDATA) as *mut Mutex<CanvasState>;
                     if !bh_ptr.is_null() {
                         let _ = Box::from_raw(bh_ptr);
                     }
@@ -456,34 +530,57 @@ pub fn create_window(title: &str, w: i32, h: i32) -> u64 {
 
                 // On each loop try to paint if buffer exists
                 unsafe {
-                    let bh_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Mutex<Option<(Vec<u8>, i32, i32, usize)>>;
+                    let bh_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Mutex<CanvasState>;
                     if !bh_ptr.is_null() {
-                        if let Ok(mut guard) = (*bh_ptr).lock() {
-                                if let Some((ref buf, bw, bh, _)) = *guard {
-                                // perform SetDIBitsToDevice
-                                let bmi = BITMAPINFO {
-                                    bmiHeader: BITMAPINFOHEADER {
-                                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                                        biWidth: bw,
-                                        biHeight: -bh, // top-down
-                                        biPlanes: 1,
-                                        biBitCount: 32,
-                                        biCompression: 0, // BI_RGB
-                                        biSizeImage: 0,
-                                        biXPelsPerMeter: 0,
-                                        biYPelsPerMeter: 0,
-                                        biClrUsed: 0,
-                                        biClrImportant: 0,
-                                    },
-                                    bmiColors: [0,0,0,0],
-                                };
-                                let mut ps: PAINTSTRUCT = std::mem::zeroed();
-                                let hdc = BeginPaint(hwnd as HWND, &mut ps as *mut _);
-                                let _ = SetDIBitsToDevice(hdc, 0, 0, bw as u32, bh as u32, 0, 0, 0, bh as u32,
-                                                         buf.as_ptr() as *const c_void, &bmi as *const _, 0);
-                                EndPaint(hwnd as HWND, &mut ps as *mut _);
-                                // clear buffer after paint
-                                *guard = None;
+                        if let Ok(guard) = (*bh_ptr).lock() {
+                            if guard.buf.len() >= 4 {
+                                // perform SetDIBitsToDevice using current guard.w/guard.h
+                                let bw = guard.w;
+                                let bh = guard.h;
+                                if bw > 0 && bh > 0 {
+                                    let bmi = BITMAPINFO {
+                                        bmiHeader: BITMAPINFOHEADER {
+                                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                                            biWidth: bw,
+                                            biHeight: -bh, // top-down
+                                            biPlanes: 1,
+                                            biBitCount: 32,
+                                            biCompression: 0, // BI_RGB
+                                            biSizeImage: 0,
+                                            biXPelsPerMeter: 0,
+                                            biYPelsPerMeter: 0,
+                                            biClrUsed: 0,
+                                            biClrImportant: 0,
+                                        },
+                                        bmiColors: [0,0,0,0],
+                                    };
+                                    let mut ps: PAINTSTRUCT = std::mem::zeroed();
+                                    let hdc = BeginPaint(hwnd as HWND, &mut ps as *mut _);
+                                    // Get client rect to know destination size
+                                    let mut rc: RECT = std::mem::zeroed();
+                                    GetClientRect(hwnd as HWND, &mut rc as *mut _);
+                                    let dest_w = (rc.right - rc.left).max(1);
+                                    let dest_h = (rc.bottom - rc.top).max(1);
+                                    // Use StretchDIBits to scale source buffer (guard.w x guard.h) into client rect
+                                    let _ = StretchDIBits(hdc, 0, 0, dest_w as c_int, dest_h as c_int,
+                                                          0, 0, bw as c_int, bh as c_int,
+                                                          guard.buf.as_ptr() as *const c_void, &bmi as *const _, 0, SRCCOPY);
+                                    // draw queued texts (if any) using GDI TextOutW
+                                    let mut win_id_opt: Option<u64> = None;
+                                    if let Ok(map) = hwnd_map().lock() {
+                                        if let Some(id) = map.get(&(hwnd as usize)) { win_id_opt = Some(*id); }
+                                    }
+                                    if let Some(win_id) = win_id_opt {
+                                        let texts = take_texts(win_id);
+                                        for (tx, ty, s) in texts.into_iter() {
+                                            let wide = to_wide(&s);
+                                            unsafe {
+                                                TextOutW(hdc, tx as c_int, ty as c_int, wide.as_ptr(), (wide.len()-1) as c_int);
+                                            }
+                                        }
+                                    }
+                                    EndPaint(hwnd as HWND, &mut ps as *mut _);
+                                }
                             }
                         }
                     }
@@ -501,6 +598,38 @@ pub fn blit_window(id: u64, buf: Vec<u8>, w: i32, h: i32) -> Result<(), String> 
         tx.send(WindowCommand::Blit(buf, w, h)).map_err(|e| e.to_string())
     } else {
         Err("window id not found".to_string())
+    }
+}
+
+/// Set global theme by name: "light" or "dark". Updates background color for existing windows.
+pub fn set_theme(name: &str) {
+    let mut bg = theme_bg().lock().unwrap();
+    match name.to_lowercase().as_str() {
+        "dark" => { *bg = [30u8,30u8,30u8,255u8]; }
+        "light" => { *bg = [240u8,240u8,240u8,255u8]; }
+        _ => { /* unknown, ignore */ }
+    }
+    // update existing windows' canvas bg and fill buffers
+    if let Ok(reg) = registry().lock() {
+        for (win_id, _tx) in reg.iter() {
+            // find hwnd for this win_id and update canvas if present
+            if let Ok(map) = hwnd_map().lock() {
+                for (hw, id) in map.iter() {
+                    if id == win_id {
+                        unsafe {
+                            let bh_ptr = GetWindowLongPtrW(*hw as HWND, GWLP_USERDATA) as *mut Mutex<CanvasState>;
+                            if !bh_ptr.is_null() {
+                                if let Ok(mut guard) = (*bh_ptr).lock() {
+                                    guard.bg = *bg;
+                                    for i in (0..guard.buf.len()).step_by(4) { guard.buf[i+0]=bg[0]; guard.buf[i+1]=bg[1]; guard.buf[i+2]=bg[2]; guard.buf[i+3]=bg[3]; }
+                                }
+                                InvalidateRect(*hw as HWND, null(), 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

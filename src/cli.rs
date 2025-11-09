@@ -51,6 +51,87 @@ pub fn run() {
                     Err(e) => eprintln!("failed to read script {}: {}", script, e),
                 }
             }
+            "install" => {
+                // install current exe to a user-local bin directory
+                let me = match std::env::current_exe() { Ok(p) => p, Err(e) => { eprintln!("failed to locate current exe: {}", e); return; } };
+                #[cfg(target_os = "windows")]
+                let home = std::env::var("USERPROFILE").unwrap_or(".".to_string());
+                #[cfg(not(target_os = "windows"))]
+                let home = std::env::var("HOME").unwrap_or(".".to_string());
+                #[cfg(target_os = "windows")]
+                let dest_dir = format!("{}\\bin", home);
+                #[cfg(not(target_os = "windows"))]
+                let dest_dir = format!("{}/.local/bin", home);
+                if let Err(e) = std::fs::create_dir_all(&dest_dir) { eprintln!("failed to create {}: {}", dest_dir, e); return; }
+                #[cfg(target_os = "windows")]
+                let dest = format!("{}\\userd.exe", dest_dir);
+                #[cfg(not(target_os = "windows"))]
+                let dest = format!("{}/userd", dest_dir);
+                match std::fs::copy(&me, &dest) {
+                    Ok(_) => {
+                        #[cfg(not(target_os = "windows") )]
+                        { let _ = std::process::Command::new("chmod").args(["+x", &dest]).status(); }
+                        println!("installed {} -> {}", me.display(), dest);
+                        // optionally auto-add to PATH on Windows
+                        if args.len() > 2 && args[2] == "--add-path" {
+                            #[cfg(target_os = "windows")]
+                            {
+                                // Use PowerShell to set user PATH (no admin required)
+                                let get_cmd = r#"[Environment]::GetEnvironmentVariable('Path','User')"#;
+                                let out = std::process::Command::new("powershell").args(["-NoProfile","-Command", get_cmd]).output();
+                                if let Ok(o) = out {
+                                    let cur = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                    if !cur.split(';').any(|p| p.eq_ignore_ascii_case(&dest_dir)) {
+                                        let new = if cur.is_empty() { dest_dir.clone() } else { format!("{};{}", cur, dest_dir) };
+                                        let set_cmd = format!("[Environment]::SetEnvironmentVariable('Path','{}','User')", new.replace("'","''"));
+                                        let _ = std::process::Command::new("powershell").args(["-NoProfile","-Command", &set_cmd]).status();
+                                        println!("Added {} to user PATH (effective for new processes).", dest_dir);
+                                    } else { println!("{} already present in user PATH.", dest_dir); }
+                                } else { eprintln!("failed to query user PATH"); }
+                            }
+                        } else {
+                            println!("Make sure {} is in your PATH (add {} to PATH if needed)", dest_dir, dest_dir);
+                        }
+                    }
+                    Err(e) => { eprintln!("failed to copy to {}: {}", dest, e); }
+                }
+            }
+            "uninstall" => {
+                // remove installed executable and optionally remove PATH entry
+                #[cfg(target_os = "windows")]
+                let home = std::env::var("USERPROFILE").unwrap_or(".".to_string());
+                #[cfg(not(target_os = "windows"))]
+                let home = std::env::var("HOME").unwrap_or(".".to_string());
+                #[cfg(target_os = "windows")]
+                let dest_dir = format!("{}\\bin", home);
+                #[cfg(not(target_os = "windows"))]
+                let dest_dir = format!("{}/.local/bin", home);
+                #[cfg(target_os = "windows")]
+                let dest = format!("{}\\userd.exe", dest_dir);
+                #[cfg(not(target_os = "windows"))]
+                let dest = format!("{}/userd", dest_dir);
+                if std::path::Path::new(&dest).exists() {
+                    if let Err(e) = std::fs::remove_file(&dest) { eprintln!("failed to remove {}: {}", dest, e); }
+                    else { println!("removed {}", dest); }
+                    // remove PATH entry if --remove-path provided
+                    if args.len() > 2 && args[2] == "--remove-path" {
+                        #[cfg(target_os = "windows")]
+                        {
+                            let get_cmd = r#"[Environment]::GetEnvironmentVariable('Path','User')"#;
+                            if let Ok(o) = std::process::Command::new("powershell").args(["-NoProfile","-Command", get_cmd]).output() {
+                                let cur = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                let parts: Vec<&str> = cur.split(';').filter(|p| !p.eq_ignore_ascii_case(&dest_dir) && !p.is_empty()).collect();
+                                let new = parts.join(";");
+                                let set_cmd = format!("[Environment]::SetEnvironmentVariable('Path','{}','User')", new.replace("'","''"));
+                                let _ = std::process::Command::new("powershell").args(["-NoProfile","-Command", &set_cmd]).status();
+                                println!("Removed {} from user PATH (effective for new processes).", dest_dir);
+                            }
+                        }
+                    }
+                } else {
+                    println!("{} not found, nothing to uninstall.", dest);
+                }
+            }
             "compile" => {
                 // compile a .usrd source into a .usrdc artifact: userd compile in.usrd out.usrdc
                 if args.len() < 4 {
