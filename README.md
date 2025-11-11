@@ -13,7 +13,7 @@
 Сборка и тесты (Windows PowerShell):
 
 ```powershell
-cd C:\Users\1thproj\Documents\rustprojects\userd
+cd example\userd
 cargo test
 ```
 
@@ -261,7 +261,10 @@ gui_run();
 
 - Полная программная отрисовка (software renderer), виджеты (button, textbox), система событий и обработчиков в VM.
 - Расширение синтаксиса (модули, import), улучшенная типизация и компиляция.
+<<<<<<< HEAD
 
 Авторские права / лицензия
 
 - Репозиторий экспериментальный — добавьте лицензию, если планируете распространять.
+=======
+>>>>>>> 70c18529f47c392de088e2fd171a7b60df884bcf
